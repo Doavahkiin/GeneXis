@@ -70,9 +70,9 @@ client.player = new Manager({
     plugins,
     nodes: [
         {
-            host: "pnode1.danbot.host",
-            port: 7265,
-            password: "7826",
+            host: "lava-v3.ajieblogs.eu.org",
+            port: 80,
+            password: "https://dsc.gg/ajidevserver6",
             secure: false,
         },
     ],
