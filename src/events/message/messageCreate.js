@@ -16,7 +16,10 @@ const db = require("pro.db");
 const groq = require("groq-sdk");
 const { ai_prompt } = require("../../config/bot");
 const Groq = new groq.Groq({
-  apiKey: process.env.GROQ
+  apiKey: process.env.GROQ,
+  defaultHeaders: {
+    "Groq-Model-Version": "2025-11-11"
+  }
 })
 /**
  * 
@@ -228,14 +231,31 @@ module.exports = async (client, message) => {
     }
   });
 
-  // Chat bot
-  chatBotSchema.findOne({ Guild: message.guild.id }, async (err, data) => {
-    if (!data) return;
-    if (message.channel.id !== data.Channel) return;
-    if (process.env.GROQ) {
+// Chat bot
+chatBotSchema.findOne({ Guild: message.guild.id }, async (err, data) => {
+  if (!data) return;
+  if (message.channel.id !== data.Channel) return;
+  
+  // Prevent bot from responding to itself
+  if (message.author.bot) return;
+  
+  // Add typing indicator
+  message.channel.sendTyping().catch(() => {});
+  
+  // Configuration
+  const MAX_HISTORY = 20;
+  const DISCORD_MAX_CHARS = 2000;
+  const TRUNCATE_THRESHOLD = 1950;
+  
+  if (process.env.GROQ) {
+    try {
       Groq.apiKey = process.env.GROQ;
-      const key = `chat:${message.guild.id}:${message.author.id}`
+      const key = `chat:${message.guild.id}:${message.author.id}`;
+      
+      // Get or initialize chat history
       const userChat = db.get(key) || [];
+      
+      // Add user message to history
       const messages = [
         ...userChat,
         {
@@ -243,69 +263,224 @@ module.exports = async (client, message) => {
           content: message.cleanContent
         }
       ];
-
+      
+      // Prepare system prompt
+      const systemPrompt = ai_prompt ?? "You are a helpful assistant.";
+      
+      // Call Groq API
       const response = await Groq.chat.completions.create({
-        messages: [{
-          role: "system",
-          content: ai_prompt ?? "you are a helpful assistant."
-        }, ...messages],
-        model: "mixtral-8x7b-32768",
-        temperature: 0.7,
-        max_tokens: 1024,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          ...messages.slice(-MAX_HISTORY) // Limit context window
+        ],
+        model: "groq/compound",
+        temperature: 1,
+        max_tokens: 8192,
       });
-
-      let res = response.choices?.[0]?.message?.content
-
-      // slicing res 
-      if(res.length > 1950) res = res.slice(0, 1950) + "... i was unable to send the full response, type \`continue\`"
-
-      await message.reply({
-        content: res ?? "No response."
-      })
-
-
+      
+      console.log("Groq API Response:", response); // Debug log
+      
+      let res = response.choices?.[0]?.message?.content || "No response generated.";
+      console.log("Extracted response:", res); // Debug log
+      
+      // Add assistant response to history
       messages.push({
         role: "assistant",
-        content: res ?? "No response."
-      })
-
-
-
-      db.set(key, messages.slice(-20));
-
-    } else {
-      try {
-        const input = message;
-        try {
-          fetch(
-            `https://api.coreware.nl/fun/chat?msg=${encodeURIComponent(input)}&uid=${message.author.id}`,
-          )
-            .catch(() => { console.log })
-            .then((res) => res.json())
-            .catch(() => { console.log })
-            .then(async (json) => {
-              console.log(json);
-              if (json) {
-                if (
-                  json.response !== " " ||
-                  json.response !== undefined ||
-                  json.response !== "" ||
-                  json.response !== null
-                ) {
-                  try {
-                    return message
-                      .reply({ content: json.response })
-                      .catch(() => { });
-                  } catch { }
-                }
-              }
-            })
-            .catch(() => { });
-        } catch { }
-      } catch { }
+        content: res
+      });
+      
+      // Save history (limit to last MAX_HISTORY messages)
+      db.set(key, messages.slice(-MAX_HISTORY));
+      
+      // Send the response
+      await sendMessage(message, res, TRUNCATE_THRESHOLD);
+      
+    } catch (error) {
+      console.error("Groq API Error:", error);
+      
+      // Send error message to user
+      const errorMessage = `Sorry, I encountered an error: ${error.message}`;
+      await message.reply({
+        content: errorMessage.slice(0, DISCORD_MAX_CHARS),
+        failIfNotExists: false
+      }).catch(console.error);
     }
-  });
+  } else {
+    // Fallback to external API
+    try {
+      const response = await fetch(
+        `https://api.coreware.nl/fun/chat?msg=${encodeURIComponent(message.cleanContent)}&uid=${message.author.id}`
+      );
+      
+      if (!response.ok) {
+        throw new Error(`API returned ${response.status}`);
+      }
+      
+      const json = await response.json();
+      console.log("Fallback API Response:", json); // Debug log
+      
+      if (json?.response && json.response.trim().length > 0) {
+        await sendMessage(message, json.response, TRUNCATE_THRESHOLD);
+      } else {
+        await message.reply({
+          content: "I couldn't generate a response right now.",
+          failIfNotExists: false
+        }).catch(console.error);
+      }
+    } catch (error) {
+      console.error("Fallback API Error:", error);
+      await message.reply({
+        content: "Sorry, I'm having trouble responding right now.",
+        failIfNotExists: false
+      }).catch(console.error);
+    }
+  }
+});
 
+/**
+ * Sends a message, splitting it if necessary
+ * @param {Message} originalMessage - The original Discord message
+ * @param {string} content - The content to send
+ * @param {number} chunkSize - Maximum characters per chunk (default 1950)
+ */
+async function sendMessage(originalMessage, content, chunkSize = 1950) {
+  console.log("sendMessage called with content:", content ? `"${content.substring(0, 50)}..."` : "null/undefined"); // Debug log
+  
+  // Check if content is valid
+  if (!content || typeof content !== 'string' || content.trim().length === 0) {
+    console.log("Content is empty or invalid, sending fallback message");
+    await originalMessage.reply({
+      content: "I couldn't generate a response. Please try again.",
+      failIfNotExists: false
+    }).catch(console.error);
+    return;
+  }
+  
+  // Trim the content
+  content = content.trim();
+  
+  // If content is short enough, send it directly
+  if (content.length <= chunkSize) {
+    try {
+      await originalMessage.reply({
+        content: content,
+        failIfNotExists: false
+      });
+    } catch (error) {
+      console.error("Failed to send message:", error);
+      await originalMessage.reply({
+        content: "Error sending response.",
+        failIfNotExists: false
+      }).catch(console.error);
+    }
+    return;
+  }
+  
+  // Split and send if too long
+  const chunks = splitMessage(content, chunkSize);
+  console.log(`Split message into ${chunks.length} chunks`); // Debug log
+  
+  // Send first chunk as a reply
+  try {
+    await originalMessage.reply({
+      content: chunks[0],
+      failIfNotExists: false
+    });
+  } catch (error) {
+    console.error("Failed to send first chunk:", error);
+    return;
+  }
+  
+  // Send remaining chunks as follow-up messages
+  for (let i = 1; i < chunks.length; i++) {
+    try {
+      await originalMessage.channel.send({
+        content: chunks[i],
+        reply: { messageReference: originalMessage.id, failIfNotExists: false }
+      });
+      // Add small delay to avoid rate limiting
+      if (i < chunks.length - 1) await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (error) {
+      console.error(`Failed to send chunk ${i}:`, error);
+      break;
+    }
+  }
+}
+
+/**
+ * Splits a string into chunks of specified size
+ * @param {string} str - The string to split
+ * @param {number} chunkSize - Maximum size of each chunk
+ * @returns {string[]} Array of string chunks
+ */
+function splitMessage(str, chunkSize) {
+  // Validate input
+  if (!str || str.length <= chunkSize) {
+    return [str];
+  }
+  
+  const chunks = [];
+  const paragraphs = str.split('\n\n');
+  let currentChunk = '';
+  
+  for (const paragraph of paragraphs) {
+    // Calculate new chunk length if we add this paragraph
+    const newChunkLength = currentChunk.length + (currentChunk ? '\n\n'.length : 0) + paragraph.length;
+    
+    if (newChunkLength > chunkSize) {
+      // If current chunk has content, save it
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = '';
+      }
+      
+      // If paragraph itself is too long, split it further
+      if (paragraph.length > chunkSize) {
+        const lines = paragraph.split('\n');
+        for (const line of lines) {
+          if (currentChunk.length + line.length + 1 > chunkSize) {
+            if (currentChunk) {
+              chunks.push(currentChunk);
+              currentChunk = '';
+            }
+            
+            // If line is still too long, split by words
+            if (line.length > chunkSize) {
+              const words = line.split(' ');
+              for (const word of words) {
+                if (currentChunk.length + word.length + 1 > chunkSize) {
+                  if (currentChunk) {
+                    chunks.push(currentChunk);
+                    currentChunk = '';
+                  }
+                }
+                currentChunk += (currentChunk ? ' ' : '') + word;
+              }
+            } else {
+              currentChunk = line;
+            }
+          } else {
+            currentChunk += (currentChunk ? '\n' : '') + line;
+          }
+        }
+      } else {
+        currentChunk = paragraph;
+      }
+    } else {
+      currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
+    }
+  }
+  
+  // Add the last chunk if it exists
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+  
+  return chunks;
+}
   // Sticky messages
   try {
     Schema.findOne(
