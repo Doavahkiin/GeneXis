@@ -21,7 +21,7 @@ console.log(`\u001b[0m`);
 app.get("/", (req, res) => {
     res.sendFile(path.join(__dirname, "config", "template.html"));
 });
-app.listen(7820, () => console.log(chalk.blue(chalk.bold(`Server`)), (chalk.white(`>>`)), (chalk.green(`Running on`)), (chalk.red(`7820`))))
+app.listen(443, () => console.log(chalk.blue(chalk.bold(`Server`)), (chalk.white(`>>`)), (chalk.green(`Running on`)), (chalk.red(`443`))))
 require('./bot')
 
 // Webhooks
